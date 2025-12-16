@@ -1,228 +1,307 @@
-import os
+from dotenv import load_dotenv
+import argparse
 import json
-import math
-import string
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from rouge_score import rouge_scorer
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from langchain_text_splitters import RecursiveCharacterTextSplitter
- 
+import os
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Tuple
+import statistics
+
+# NLP / embedding / retrieval / llm
+# using mistral
+from langchain_mistralai import ChatMistralAI
 
 
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import CharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_community.llms import Ollama
-from langchain_classic.chains import RetrievalQA
-from langchain_ollama import OllamaLLM
-
-CORPUS_DIR = "corpus"
-TEST_DATASET = "test_dataset.json"
 
 
-# ------------------------------------------------------------
-# Load Test Dataset (FIXED)
-# ------------------------------------------------------------
-def load_test_dataset():
-    with open(TEST_DATASET, "r", encoding="utf-8") as f:
-        data = json.load(f)
+from sentence_transformers import SentenceTransformer
+import nltk
 
-    # Correct extraction (the FIX)
-    if "test_questions" not in data or not isinstance(data["test_questions"], list):
-        raise ValueError("❌ test_dataset.json is malformed. Must contain a list under 'test_questions'.")
+# plotting
+import matplotlib.pyplot as plt
 
-    return data["test_questions"]
+# internal imports
+from evaluation_functions import (retrieval_hit_rate, retrieval_mrr, precision_at_k,
+                                  compute_rouge_l, compute_bleu, compute_cosine_sim,
+                                  compute_relevance, compute_faithfulness)
+from utils import ensure_dir, prepare_corpus, smart_chunk_text ,index_chunks
 
-
-# ------------------------------------------------------------
-# Load corpus (same as before)
-# ------------------------------------------------------------
-def load_documents():
-    documents = {}
-
-    for filename in sorted(os.listdir(CORPUS_DIR)):
-        if filename.endswith(".txt"):
-            path = os.path.join(CORPUS_DIR, filename)
-            with open(path, "r", encoding="utf-8") as f:
-                documents[filename] = f.read()
-
-    print(f"{len(documents)} documents loaded from corpus/")
-    return documents
+# load environment variables from .env file
+load_dotenv()
 
 
-# ------------------------------------------------------------
-# Flexible chunking
-# ------------------------------------------------------------
-def chunk_documents(docs, chunk_size, overlap):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
-        separators=["\n\n", "\n", ".", " ", ""]
-    )
 
-    chunks = []
-    metadata = []
-
-    for filename, content in docs.items():
-        chunks_split = text_splitter.split_text(content)
-        for chunk in chunks_split:
-            chunks.append(chunk)
-            metadata.append({"source": filename})
-
-    print(f"Chunks created: {len(chunks)}")
-    return chunks, metadata
+nltk.download('punkt', quiet=True)
+nltk.download('punkt_tab')
 
 
-# ------------------------------------------------------------
-# Build vector store
-# ------------------------------------------------------------
-def build_vector_store(chunks, metadata):
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectordb = Chroma.from_texts(texts=chunks, metadatas=metadata, embedding=embeddings)
-    return vectordb
 
 
-# ------------------------------------------------------------
-# RAG Answering
-from langchain_ollama import OllamaLLM
-from langchain_classic.chains import RetrievalQA
 
-def generate_answer(query, retriever):
-    llm = OllamaLLM(model="llama3.2", temperature=0)
+# -------------------- LLM + Answer Generation --------------------
+def generate_answer(llm: ChatMistralAI, question: str, retrieved_texts: List[str]) -> Tuple[str, List[str]]:
+    """
+    Return (answer, extracted_sources) using Groq LLM.
+    """
+    prompt_template = """You are an assistant that has access to retrieved passages. Answer the question concisely in one paragraph.
+    Then on a new line write: SOURCES: <comma-separated list of source filenames used>
 
-    # Create a RetrievalQA chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True
-    )
+    Question: {question}
 
-    # Run the chain
-    result = qa_chain.invoke({"query": query})
+    Passages:
+    {passages}
 
-    # result is a dict: {'result': answer_text, 'source_documents': [docs]}
-    answer = result["result"]
-    retrieved_docs = result["source_documents"]
+    Answer:
+    """
+    formatted = prompt_template.format(question=question, passages="\n\n".join(retrieved_texts))
 
-    return answer, retrieved_docs
-
- 
-# ------------------------------------------------------------
- 
-
-# ------------------------------------------------------------
-# Evaluation Metrics
-# ------------------------------------------------------------
-def hit_rate(gt_sources, retrieved_docs):
-    retrieved = [d.metadata["source"] for d in retrieved_docs]
-    return int(any(src in retrieved for src in gt_sources))
-
-
-def mrr(gt_sources, retrieved_docs):
-    retrieved = [d.metadata["source"] for d in retrieved_docs]
-    for idx, src in enumerate(retrieved):
-        if src in gt_sources:
-            return 1 / (idx + 1)
-    return 0.0
-
-
-def precision_at_k(gt_sources, retrieved_docs, k=3):
-    retrieved = [d.metadata["source"] for d in retrieved_docs[:k]]
-    hits = sum([1 for src in retrieved if src in gt_sources])
-    return hits / k
-
-
-def rouge_l(pred, ref):
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-    return scorer.score(ref, pred)["rougeL"].fmeasure
-
-
-def bleu_score(pred, ref):
-    smoothie = SmoothingFunction().method1
-    return sentence_bleu([ref.split()], pred.split(), smoothing_function=smoothie)
-
-
-def cosine_sim(pred, ref):
-    embed = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    v1 = embed.embed_query(pred)
-    v2 = embed.embed_query(ref)
-    return float(cosine_similarity([v1], [v2])[0][0])
-
-
-# ------------------------------------------------------------
-# Main Evaluation per Chunking Strategy
-# ------------------------------------------------------------
-def evaluate_configuration(chunk_size, overlap, test_questions):
-    print(f"\n=== Running evaluation for CHUNK={chunk_size}, OVERLAP={overlap} ===")
-
-    docs = load_documents()
-    chunks, metadata = chunk_documents(docs, chunk_size, overlap)
-    vectordb = build_vector_store(chunks, metadata)
-
-    retriever = vectordb.as_retriever(search_kwargs={"k": 3})
-
-    scores = {
-        "hit_rate": [],
-        "mrr": [],
-        "precision@3": [],
-        "rougeL": [],
-        "bleu": [],
-        "cosine": []
-    }
-
-    for item in test_questions:
-        qid = item["id"]
-        q = item["question"]
-        gt = item["ground_truth"]
-        gt_docs = item["source_documents"]
-
-        pred, retrieved = generate_answer(q, retriever)
-
-        scores["hit_rate"].append(hit_rate(gt_docs, retrieved))
-        scores["mrr"].append(mrr(gt_docs, retrieved))
-        scores["precision@3"].append(precision_at_k(gt_docs, retrieved))
-        scores["rougeL"].append(rouge_l(pred, gt))
-        scores["bleu"].append(bleu_score(pred, gt))
-        scores["cosine"].append(cosine_sim(pred, gt))
-
-    return {
-        "chunk_size": chunk_size,
-        "overlap": overlap,
-        "hit_rate": float(np.mean(scores["hit_rate"])),
-        "mrr": float(np.mean(scores["mrr"])),
-        "precision@3": float(np.mean(scores["precision@3"])),
-        "rougeL": float(np.mean(scores["rougeL"])),
-        "bleu": float(np.mean(scores["bleu"])),
-        "cosine": float(np.mean(scores["cosine"]))
-    }
-
-
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
-def main():
-    test_questions = load_test_dataset()
-
-    configurations = [
-        (250, 50),
-        (550, 50),
-        (900, 100)
+    # Groq uses messages: list of tuples (role, content)
+    messages = [
+        ("system", "You are a helpful assistant."),
+        ("user", formatted)
     ]
 
-    all_results = []
+    resp = llm.invoke(messages)
+    answer_text = resp.content.strip()
 
-    for chunk, ov in configurations:
-        res = evaluate_configuration(chunk, ov, test_questions)
-        all_results.append(res)
+    # extract SOURCES
+    sources = []
+    for line in answer_text.splitlines()[::-1]:
+        if line.strip().lower().startswith("sources:"):
+            src_line = line.split(":", 1)[1]
+            pieces = re.split(r"[,;]+", src_line)
+            sources = [s.strip() for s in pieces if s.strip()]
+            break
 
-    with open("test_results.json", "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=4)
+    return answer_text, sources
 
-    print("\n✔ Results written to test_results.json")
+# -------------------- Analysis --------------------
+def analyze_results(all_results: Dict[str, Any], output_dir: str, top_n_failures: int = 5) -> None:
+    """
+    Create a human-readable analysis file (results_analysis.md) and plots.
+    """
+    ensure_dir(output_dir)
+    md_lines = []
+    md_lines.append(f"# RAG Evaluation Analysis\n")
+    md_lines.append(f"Generated: {datetime.utcnow().isoformat()} UTC\n")
+    md_lines.append("\n## Aggregate comparison\n")
 
+    # For plots: collect metric means per chunk key
+    metric_keys = ['hit_rate', 'mrr', 'precision@1', 'precision@5', 'rouge_l', 'bleu', 'cosine_sim', 'relevance', 'faithfulness']
+    chunk_keys = list(all_results.keys())
+    # gather means
+    means = {m: [] for m in metric_keys}
+    for ck in chunk_keys:
+        agg = all_results[ck]['aggregate']
+        for m in metric_keys:
+            means[m].append(agg.get(m, {}).get('mean', 0.0))
+
+    # write table
+    header = "| Chunk Size | " + " | ".join([k.replace('_', ' ').upper() for k in metric_keys]) + " |"
+    sep = "|---" * (len(metric_keys) + 1) + "|"
+    md_lines.append(header)
+    md_lines.append(sep)
+    for i, ck in enumerate(chunk_keys):
+        row = f"| {ck} | " + " | ".join(f"{means[m][i]:.3f}" for m in metric_keys) + " |"
+        md_lines.append(row)
+
+    # plots - one plot per metric
+    plots_dir = Path(output_dir) / "plots"
+    ensure_dir(str(plots_dir))
+    for m in metric_keys:
+        plt.figure(figsize=(8, 4))
+        plt.plot(chunk_keys, means[m], marker='o')
+        plt.title(m.replace('_', ' ').title())
+        plt.xlabel("Chunk Size")
+        plt.ylabel("Mean")
+        plt.grid(True)
+        plt.tight_layout()
+        fname = plots_dir / f"{m}.png"
+        plt.savefig(fname)
+        plt.close()
+        md_lines.append(f"\n![{m}](plots/{fname.name})\n")
+
+    # failure mode extraction: worst per-chunk by rouge_l (or hit_rate)
+    md_lines.append("\n## Failure Mode Analysis\n")
+    for ck in chunk_keys:
+        per_q = all_results[ck]['per_question']
+        # sort by rouge_l ascending (worst first) for answerable questions
+        worst = sorted([q for q in per_q if q.get('answerable', True)], key=lambda x: x['metrics'].get('rouge_l', 0.0))
+        md_lines.append(f"\n### Chunk: {ck} — Worst {top_n_failures} by ROUGE-L\n")
+        for w in worst[:top_n_failures]:
+            md_lines.append(f"- ID: {w['id']} — Q: {w['question'][:120]}...\n")
+            md_lines.append(f"  - ROUGE-L: {w['metrics']['rouge_l']:.3f}, BLEU: {w['metrics']['bleu']:.3f}, CosSim: {w['metrics']['cosine_sim']:.3f}\n")
+            md_lines.append(f"  - Retrieved: {w['retrieved_sources']}\n")
+            short_ans = (w['answer'][:250] + '...') if len(w['answer']) > 250 else w['answer']
+            md_lines.append(f"  - Answer (truncated): `{short_ans}`\n")
+
+    # recommendation heuristics: simple rule-based
+    # choose chunk with highest mean(relevance + faithfulness + hit_rate)
+    scores = {}
+    for ck in chunk_keys:
+        agg = all_results[ck]['aggregate']
+        score = (agg['relevance']['mean'] + agg['faithfulness']['mean'] + agg['hit_rate']['mean']) / 3.0
+        scores[ck] = score
+    best_ck = max(scores.items(), key=lambda x: x[1])[0]
+    md_lines.append(f"\n## Recommendation\nBased on a combined heuristic (relevance + faithfulness + hit_rate) the recommended chunk configuration is **{best_ck}**.\n")
+
+    # save analysis markdown
+    analysis_path = Path(output_dir) / "results_analysis.md"
+    analysis_path.write_text("\n".join(md_lines), encoding='utf-8')
+    print(f"Saved analysis to {analysis_path}")
+
+
+# -------------------- Main evaluation driver --------------------
+def evaluate_all(corpus_dir: str, test_dataset_path: str, output_dir: str,
+                 chunk_ranges: List[Tuple[int, int]], overlap: int = 0, top_k: int = 5,
+                 embeddings_model_name: str = 'sentence-transformers/all-MiniLM-L6-v2',
+                 persist_directory: str = None):
+    ensure_dir(output_dir)
+    texts = prepare_corpus(corpus_dir)
+    with open(test_dataset_path, 'r', encoding='utf-8') as f:
+        test = json.load(f)
+    questions = test['test_questions']
+
+    st_model = SentenceTransformer('all-MiniLM-L6-v2')
+    # llm = Ollama(model="mistral-7b", verbose=False)
+    # mistral-7b is not avilable in mistral's cloud  
+    llm = ChatMistralAI(model_name="mistral-large-2512", temperature=0.0)
+    
+
+    all_results = {}
+
+    for (min_c, max_c) in chunk_ranges:
+        key = f"{min_c}_{max_c}"
+        print(f"\n--- Evaluating chunks {min_c}-{max_c} (overlap={overlap}) ---")
+        # build chunks
+        chunks = []
+        cid = 0
+        for fname, text in texts.items():
+            pieces = smart_chunk_text(text, min_c, max_c, overlap=overlap)
+            for ptxt in pieces:
+                chunks.append({'id': f"{fname}#c{cid}", 'text': ptxt, 'source': fname})
+                cid += 1
+
+        vectordb = index_chunks(chunks, embeddings_model_name=embeddings_model_name, persist_directory=persist_directory)
+
+        per_q_results = []
+        for q in questions:
+            qid = q['id']
+            qtext = q['question']
+            ground = q['ground_truth']
+            gt_docs = q.get('source_documents', [])
+
+            docs = vectordb.similarity_search_with_score(qtext, k=top_k)
+            retrieved_texts = [d.page_content for d, score in docs]
+            retrieved_meta = [d.metadata.get('source') for d, score in docs]
+
+            # retrieval metrics
+            hit = retrieval_hit_rate(retrieved_meta, gt_docs)
+            mrr = retrieval_mrr(retrieved_meta, gt_docs)
+            p1 = precision_at_k(retrieved_meta, gt_docs, 1)
+            p5 = precision_at_k(retrieved_meta, gt_docs, top_k)
+
+            # LLM answer + extracted sources
+            answer, extracted_sources = generate_answer(llm, qtext, retrieved_texts[:3])
+
+            # answer metrics
+            rouge_l = compute_rouge_l(answer, ground) if q.get('answerable', True) else 0.0
+            bleu = compute_bleu(answer, ground) if q.get('answerable', True) else 0.0
+            cos_sim = compute_cosine_sim(st_model, answer, ground) if q.get('answerable', True) else 0.0
+            relevance = compute_relevance(answer, ground) if q.get('answerable', True) else 0.0
+            faith = compute_faithfulness(answer, " ".join(retrieved_texts))
+
+            per_q_results.append({
+                'id': qid,
+                'question': qtext,
+                'retrieved_sources': retrieved_meta,
+                'extracted_sources': extracted_sources,
+                'answer': answer,
+                'metrics': {
+                    'hit_rate': hit,
+                    'mrr': mrr,
+                    'precision@1': p1,
+                    f'precision@{top_k}': p5,
+                    'rouge_l': rouge_l,
+                    'bleu': bleu,
+                    'cosine_sim': cos_sim,
+                    'relevance': relevance,
+                    'faithfulness': faith
+                },
+                'answerable': q.get('answerable', True)
+            })
+
+        # aggregate
+        metric_names = ['hit_rate', 'mrr', 'precision@1', f'precision@{top_k}', 'rouge_l', 'bleu', 'cosine_sim', 'relevance', 'faithfulness']
+        agg = {}
+        for m in metric_names:
+            vals = [q['metrics'].get(m, 0.0) for q in per_q_results]
+            if vals:
+                agg[m] = {'mean': statistics.mean(vals), 'median': statistics.median(vals), 'stdev': statistics.pstdev(vals) if len(vals) > 1 else 0.0}
+            else:
+                agg[m] = {'mean': 0.0, 'median': 0.0, 'stdev': 0.0}
+
+        all_results[key] = {'per_question': per_q_results, 'aggregate': agg}
+
+        # save per-chunk intermediate
+        out_path = Path(output_dir) / f"results_{key}.json"
+        out_path.write_text(json.dumps(all_results[key], indent=2), encoding='utf-8')
+        print(f"Saved intermediate results to {out_path}")
+
+    # final save
+    final_path = Path(output_dir) / "test_results.json"
+    final_path.write_text(json.dumps(all_results, indent=2), encoding='utf-8')
+    print(f"\nSaved final results to {final_path}")
+
+    # run analysis
+    analyze_results(all_results, output_dir)
+
+# --------------------- Static --------------------
+CORPUS_DIR = "./corpus"
+TEST_DATASET = "./test_dataset.json"
+OUTPUT_DIR = "./results"
+
+CHUNK_RANGES = [
+    (200, 300),
+    (500, 600),
+    (800, 1000)
+]
+
+OVERLAP = 0
+TOP_K = 5
+PERSIST_DIR = None  # set to "./chroma_store" if you want persistence
+
+# -------------------- RUN EVALUATION --------------------
 
 if __name__ == "__main__":
-    main()
+    evaluate_all(
+        corpus_dir=CORPUS_DIR,
+        test_dataset_path=TEST_DATASET,
+        output_dir=OUTPUT_DIR,
+        chunk_ranges=CHUNK_RANGES,
+        overlap=OVERLAP,
+        top_k=TOP_K,
+        persist_directory=PERSIST_DIR
+    )
+# -------------------- CLI --------------------
+# if __name__ == '__main__':
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument('--corpus_dir', type=str, required=True)
+    # parser.add_argument('--test_dataset', type=str, required=True)
+    # parser.add_argument('--output_dir', type=str, default='./results')
+    # parser.add_argument('--chunk_ranges', type=str, nargs='+', default=['200-300', '500-600', '800-1000'],
+    #                     help="Space separated ranges like 200-300 500-600")
+    # parser.add_argument('--overlap', type=int, default=0, help="Character overlap between chunks")
+    # parser.add_argument('--top_k', type=int, default=5)
+    # parser.add_argument('--persist', type=str, default=None, help="Chroma persistence directory (optional)")
+    # args = parser.parse_args()
+
+    # # parse chunk ranges
+    # parsed = []
+    # for r in args.chunk_ranges:
+    #     low, high = r.split('-', 1)
+    #     parsed.append((int(low), int(high)))
+
+    # evaluate_all(args.corpus_dir, args.test_dataset, args.output_dir, parsed,
+    #              overlap=args.overlap, top_k=args.top_k, persist_directory=args.persist)
